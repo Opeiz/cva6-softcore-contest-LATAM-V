@@ -21,6 +21,6 @@ In the following images, we can observe the results usign the 2 solutions propos
 
 |  | N Instructions | Cycles | Improvement |
 |--------|----------|----------------|-----------|
-| Original  | 1731593 | 2353806 | 0.0% |
-| No Buffer | 268393 | 448409 | % |
-| Final Solution | 169116 | 280145 | % |
+| Original  | 1731593 | 2353806 | 1 |
+| No Buffer | 268393 | 448409 | 5.25 |
+| Final Solution | 169116 | 280145 | **8.40** |
