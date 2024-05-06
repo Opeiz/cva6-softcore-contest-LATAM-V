@@ -26,7 +26,7 @@
 # Date        Version  Author       Description
 # 2020-10-06  0.1      S.Jacq       Created
 # 2020-10-06  0.1      k.Eyssartier Created
-# =========================================================================== #
+# ======================================q21===================================== #
 
 XLEN ?= 32
 
@@ -54,7 +54,9 @@ bmarks = \
 	dhrystone \
 	spmv \
 	pmp \
-	mnist
+	mnist\
+	mnist_original\
+	mnist_no_buffer
 
 #--------------------------------------------------------------------
 # Build rules
@@ -87,12 +89,12 @@ INCS += -I$(src_dir)/../bsp/config \
 	
 FLAGS_STR:="$(RISCV_CFLAGS)  $(RISCV_LDFLAGS) "
 
-CFLAGS ?=-march=rv32im_zicsr -mabi=ilp32 -DPREALLOCATE=1 -fvisibility=hidden -DSTDIO_THRU_UART -O3 -mcmodel=medany   -static  -Wall -pedantic 
+CFLAGS ?=-march=rv32im_zicsr -mabi=ilp32 -DPREALLOCATE=1 -fvisibility=hidden -DSTDIO_THRU_UART -O3 -mcmodel=medany -save-temps -static  -Wall -pedantic 
 
 RISCV_CFLAGS :=-DPERFORMANCE_RUN=1 \
 		-DITERATIONS=3 \
 		-DFLAGS_STR=\"$(FLAGS_STR)\" \
-		-march=rv32im_zicsr -mabi=ilp32 -DPREALLOCATE=1 -fvisibility=hidden -DSTDIO_THRU_UART -O3 -mcmodel=medany   -static  -Wall -pedantic 
+		-march=rv32im_zicsr -mabi=ilp32 -DPREALLOCATE=1 -fvisibility=hidden -DSTDIO_THRU_UART -O3 -mcmodel=medany  -save-temps -static  -Wall -pedantic 
 
 RISCV_LDFLAGS=-L./ -lcva6 -static -nostartfiles -T $(src_dir)/../bsp/config/link.ld
 
@@ -136,6 +138,9 @@ libcva6.a: $(OBJ_BSP)
 
 %.o: %.S
 	$(RISCV_GCC) -o $@ -c $< $(CFLAGS)
+	
+#%.S: %.c
+#	$(RISCV_GCC) $(INCS) -S -o $@ -c $< $(RISCV_CFLAGS)
 
 %.mem: %.bin
 	$(utils_dir)/bin2mem.py $(src_dir)/$<
@@ -145,6 +150,13 @@ libcva6.a: $(OBJ_BSP)
 
 
 all: $(bmarks)
+
+
+#asm_mnist: mnist.S
+
+#%.S: %.c
+#	$(RISCV_GCC) $(INCS) -S -o $@ -c $(src_dir)/$(dir $<)$< $(RISCV_CFLAGS)
+
 
 
 clean:

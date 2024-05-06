@@ -91,7 +91,38 @@ module cvxif_example_coprocessor
   x_issue_t req_i;
   x_issue_t req_o;
 
+  logic reset_acc = 0;
+  logic[31:0] custom_accumulator = 32'd0;
+  logic[31:0] sum = 32'd0;
+  logic[31:0] res = 32'd0;
+  logic[31:0] result_reg = 32'd0;
 
+  logic signed[8:0] unsigned_num_0;
+  logic signed[8:0] unsigned_num_1;
+  logic signed[8:0] unsigned_num_2;
+  logic signed[8:0] unsigned_num_3;
+
+  logic signed[7:0] signed_num_0;
+  logic signed[7:0] signed_num_1;
+  logic signed[7:0] signed_num_2;
+  logic signed[7:0] signed_num_3;
+
+  logic signed[15:0] res_1;
+  logic signed[15:0] res_2;
+  logic signed[15:0] res_3;
+  logic signed[15:0] res_4;
+
+  logic [31:0] unsigned_buffer[127:0];
+  logic [31:0] buffer_input = 32'd0;
+  logic [31:0] buffer_output = 32'd0;
+  logic [6:0] buffer_addr_reg = 7'd0;
+  logic [6:0] buffer_addr = 7'd0;
+
+  logic fill_buffer_reg = 1;
+  logic fill_buffer = 1;
+
+  logic acc;
+  logic acc_reg;
 
   assign instr_push = x_issue_resp_o.accept ? 1 : 0;
   assign instr_pop = (x_commit_i.x_commit_kill && x_commit_valid_i) || x_result_valid_o;
@@ -103,8 +134,28 @@ module cvxif_example_coprocessor
   always_ff @(posedge clk_i or negedge rst_ni) begin : regs
     if (!rst_ni) begin
       x_issue_ready_o <= 1;
+      custom_accumulator <= 32'd0;
+      
+      buffer_addr_reg <= 5'd0;
+      for (int i = 0; i < 128; i++) begin
+        unsigned_buffer[i] = 32'd0;
+      end
+      fill_buffer_reg <= 1;
+
     end else begin
       x_issue_ready_o <= x_issue_ready_q;
+      result_reg <= x_result_o.data;
+      custom_accumulator <= reset_acc? 32'd0: sum;
+      acc_reg <= acc;
+      res_1 <= unsigned_num_0*signed_num_0;
+      res_2 <= unsigned_num_1*signed_num_1;
+      res_3 <= unsigned_num_2*signed_num_2;
+      res_4 <= unsigned_num_3*signed_num_3;
+      unsigned_buffer[buffer_addr_reg] <= buffer_input;
+      buffer_output <= unsigned_buffer[buffer_addr];
+      buffer_addr_reg <= buffer_addr;
+      fill_buffer_reg <= fill_buffer;
+
     end
   end
 
@@ -143,8 +194,74 @@ module cvxif_example_coprocessor
   );
 
   always_comb begin
-    x_result_o.data    = req_o.req.rs[0] + req_o.req.rs[1] + (X_NUM_RS == 3 ? req_o.req.rs[2] : 0);
-    x_result_valid_o   = (c == x_result_o.data[3:0]) && ~fifo_empty ? 1 : 0;
+
+    if (fill_buffer_reg==1) begin
+      unsigned_num_0 = req_o.req.rs[0][7:0];
+      unsigned_num_1 = req_o.req.rs[0][15:8];
+      unsigned_num_2 = req_o.req.rs[0][23:16];
+      unsigned_num_3 = req_o.req.rs[0][31:24];
+
+    end else begin
+      unsigned_num_0 = buffer_output[7:0];
+      unsigned_num_1 = buffer_output[15:8];
+      unsigned_num_2 = buffer_output[23:16];
+      unsigned_num_3 = buffer_output[31:24];
+    
+    end
+
+
+    signed_num_0 = req_o.req.rs[1][7:0];
+    signed_num_1 = req_o.req.rs[1][15:8];
+    signed_num_2 = req_o.req.rs[1][23:16];
+    signed_num_3 = req_o.req.rs[1][31:24];
+
+    res                = res_1+res_2+res_3+res_4; 
+    x_result_valid_o   = ~fifo_empty ? 1 : 0;    
+
+    if (acc_reg==1) begin
+      sum = custom_accumulator + res;
+    end else begin
+      sum = custom_accumulator;
+    end      
+
+
+
+    if (req_o.req.instr[6:0]==7'b0101011) begin
+      acc =  x_result_valid_o ? 1 : 0;
+      if (x_result_valid_o==1) begin
+        buffer_input = fill_buffer_reg ? req_o.req.rs[0] : unsigned_buffer[buffer_addr_reg];
+        buffer_addr = buffer_addr_reg + 1; 
+      end else begin
+        buffer_input = unsigned_buffer[buffer_addr_reg];
+        buffer_addr = buffer_addr_reg;
+      end
+
+    end else begin
+      acc = 0;
+      buffer_input = unsigned_buffer[buffer_addr_reg];
+      buffer_addr = buffer_addr_reg;
+    end
+    
+
+    if (req_o.req.instr[6:0]==7'b1011011) begin
+      x_result_o.data = sum;
+      reset_acc = x_result_valid_o ? 1: 0;
+      buffer_addr = 5'd0;
+      if ( x_result_valid_o == 1 ) begin
+        fill_buffer = req_o.req.rs[0] == 32'd0 ? 1 : 0;
+      end else begin
+        fill_buffer = fill_buffer_reg;
+      end
+
+    end else begin
+      x_result_o.data = result_reg;
+      fill_buffer = fill_buffer_reg;
+      reset_acc = 0;
+
+    end
+
+
+
     x_result_o.id      = req_o.req.id;
     x_result_o.rd      = req_o.req.instr[11:7];
     x_result_o.we      = req_o.resp.writeback & x_result_valid_o;

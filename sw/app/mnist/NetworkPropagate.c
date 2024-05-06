@@ -9,6 +9,9 @@
 #include "fc1.h"
 #include "fc2.h"
 
+#define FILL_BUFFER 0 
+#define USE_BUFFER 1
+
 
 static DATA_T mem[MEMORY_SIZE];
 
@@ -38,6 +41,114 @@ static void macsOnRange(const UDATA_T* __restrict inputs,
     }
 }
 
+
+static inline void CustomMacsOnRange1(const uint16_t* __restrict inputs,
+                  const int32_t* __restrict weights,
+                  int nb_iterations)
+{
+    SUM_T res=0;
+    int32_t input_;
+    for (int iter = 0; iter < nb_iterations; ++iter) {
+        input_ = inputs[2*iter]|inputs[2*iter+1]<<16;
+        asm volatile
+        (
+        "custom1   %[z], %[x], %[y]\n\t"
+        : [z] "=r" (res)
+        : [x] "r" (input_), [y] "r" (weights[iter])
+        );
+    }
+
+}
+
+static inline void CustomMacsOnRange2(const uint32_t* __restrict inputs,
+                  const int32_t* __restrict weights,
+                  int nb_iterations)
+{
+    SUM_T res=0;
+    for (int iter = 0; iter < nb_iterations/2; ++iter) {
+        int32_t w1 = weights[2*iter];
+        int32_t w2 = weights[2*iter+1];
+        int32_t i1 = inputs[2*iter];
+        int32_t i2 = inputs[2*iter+1];
+
+        asm volatile (
+            "custom1   %[res1], %[i1_reg], %[w1_reg]\n\t"
+            "custom1   %[res2], %[i2_reg], %[w2_reg]\n\t"
+            : [res1] "=&r" (res), [res2] "=&r" (res)
+            : [i1_reg] "r" (i1), [w1_reg] "r" (w1), [i2_reg] "r" (i2), [w2_reg] "r" (w2)
+        );
+    }
+
+}
+
+
+static inline void CustomMacsOnRangeBufferVersion(
+                  const int32_t* __restrict weights,
+                  int nb_iterations)
+{
+    SUM_T res=0;
+    for (int iter = 0; iter < nb_iterations/4; ++iter) {
+        int32_t w1 = weights[4*iter];
+        int32_t w2 = weights[4*iter+1];
+        int32_t w3 = weights[4*iter+2];
+        int32_t w4 = weights[4*iter+3];
+        asm volatile
+        (
+        "custom1   %[z1], %[x1], %[y1]\n\t"
+        "custom1   %[z2], %[x2], %[y2]\n\t"
+        "custom1   %[z3], %[x3], %[y3]\n\t"
+        "custom1   %[z4], %[x4], %[y4]\n\t"
+        : [z1] "=r" (res), [z2] "=r" (res), [z3] "=r" (res), [z4] "=r" (res)
+        : [x1] "r" (0), [y1] "r" (w1), [x2] "r" (0), [y2] "r" (w2),
+          [x3] "r" (0), [y3] "r" (w3), [x4] "r" (0), [y4] "r" (w4)
+        );
+    }
+}
+
+
+static inline SUM_T MacsResult(SUM_T bias)
+{
+    SUM_T res;
+    asm volatile
+    (
+    "custom2   %[z], %[x], %[y]\n\t"
+    : [z] "=r" (res)
+    : [x] "r" (FILL_BUFFER), [y] "r" (0)
+    );
+
+    return bias+res;
+}
+
+static inline SUM_T MacsResultBufferVersion(SUM_T bias)
+{
+    SUM_T res;
+    asm volatile
+    (
+    "custom2   %[z], %[x], %[y]\n\t"
+    : [z] "=r" (res)
+    : [x] "r" (USE_BUFFER), [y] "r" (0)
+    );
+
+    return bias+res;
+}
+
+
+
+static inline void SetupMacsBuffer()
+{
+    SUM_T res;
+    asm volatile
+    (
+    "custom2   %[z], %[x], %[y]\n\t"
+    : [z] "=r" (res)
+    : [x] "r" (FILL_BUFFER), [y] "r" (0)
+    );
+}
+
+
+
+
+
 static UDATA_T saturate(SUM_T value, uint32_t sat) {
     return clamp(value, (SUM_T)(0), ((SUM_T)(1) << sat) - 1);
 }
@@ -64,7 +175,384 @@ static UDATA_T sat(SUM_T weightedSum, int output,
     return saturate(weightedSum>>shift, NB_BITS);
 }
 
+
+
+
 static void convcellPropagate1(
+    const UDATA_T* __restrict inputs,
+    UDATA_T* __restrict outputs,
+    const BDATA_T* __restrict biasses,
+    const WDATA_T* __restrict weights,
+    int rescaling,
+    int NB_CHANNELS, 
+    int CHANNELS_HEIGHT, int CHANNELS_WIDTH,
+    int NB_OUTPUTS,
+    int OUTPUTS_HEIGHT, int OUTPUTS_WIDTH,
+    int PADDING_Y, int PADDING_X,
+    int STRIDE_Y, int STRIDE_X,
+    int KERNEL_HEIGHT, int KERNEL_WIDTH,
+    ActivationFunction_T ACTIVATION,
+    // Memory mapping: inputs
+    int INPUT_MEM_CONT_OFFSET,
+    int INPUT_MEM_CONT_SIZE,
+    int INPUT_MEM_WRAP_OFFSET,
+    int INPUT_MEM_WRAP_SIZE,
+    int INPUT_MEM_STRIDE,
+    // Memory mapping: outputs
+    int OUTPUT_MEM_CONT_OFFSET,
+    int OUTPUT_MEM_CONT_SIZE,
+    int OUTPUT_MEM_WRAP_OFFSET,
+    int OUTPUT_MEM_WRAP_SIZE,
+    int OUTPUT_MEM_STRIDE)
+{
+    int OUTPUTS_HEIGHT_NOPAD
+        = (CHANNELS_HEIGHT - KERNEL_HEIGHT + STRIDE_Y) / STRIDE_Y;
+    int OUTPUTS_WIDTH_NOPAD
+        = (CHANNELS_WIDTH - KERNEL_WIDTH + STRIDE_X) / STRIDE_X;
+
+    for (int oy = 0; oy < OUTPUTS_HEIGHT; ++oy) {
+        const int syMin = (PADDING_Y == 0) ? 0
+            : max(PADDING_Y - (oy * STRIDE_Y), 0);
+        const int syMax = (PADDING_Y == 0
+                && OUTPUTS_HEIGHT == OUTPUTS_HEIGHT_NOPAD) ? KERNEL_HEIGHT
+            : clamp(CHANNELS_HEIGHT + PADDING_Y - (oy * STRIDE_Y), 
+                    0, KERNEL_HEIGHT);
+        const int iy = (oy * STRIDE_Y) - PADDING_Y;
+
+        for (int ox = 0; ox < OUTPUTS_WIDTH; ++ox) {
+            
+            for (int output = 0; output < NB_OUTPUTS; ++output) {
+                // moved to inner loop for collapsing -->
+                const int sxMin = (PADDING_X == 0) ? 0
+                    : max(PADDING_X - (ox * STRIDE_X), 0);
+                const int sxMax = (PADDING_X == 0
+                        && OUTPUTS_WIDTH == OUTPUTS_WIDTH_NOPAD)
+                            ? KERNEL_WIDTH
+                    : clamp(CHANNELS_WIDTH + PADDING_X - (ox * STRIDE_X), 
+                            0, KERNEL_WIDTH);
+                const int ix = (ox * STRIDE_X) - PADDING_X;
+
+                const int oPos = (ox + OUTPUTS_WIDTH * oy);
+                int oOffset = OUTPUT_MEM_STRIDE * oPos;
+
+                if (OUTPUT_MEM_WRAP_SIZE > 0 && oOffset >= OUTPUT_MEM_CONT_SIZE) {
+                    oOffset += OUTPUT_MEM_WRAP_OFFSET - OUTPUT_MEM_CONT_OFFSET
+                                - OUTPUT_MEM_CONT_SIZE;
+                }
+                // <--
+
+                SUM_T weightedSum = biasses[output];
+
+                for (int sy = 0; sy < KERNEL_HEIGHT; ++sy) {
+                    if ((PADDING_Y != 0
+                            || OUTPUTS_HEIGHT != OUTPUTS_HEIGHT_NOPAD)
+                        && sy >= syMax - syMin)
+                    {
+                        break;
+                    }
+
+                    const int iPos = ((sxMin + ix)
+                                        + CHANNELS_WIDTH * (iy + syMin + sy));
+                    int iOffset = INPUT_MEM_STRIDE * iPos;
+
+                    // Wrapping cannot occur in the middle of a line, except if
+                    // there is only one line (1D)!
+                    bool wrapInRange = false;
+
+                    if (INPUT_MEM_WRAP_SIZE > 0
+                        && iOffset >= INPUT_MEM_CONT_SIZE)
+                    {
+                        iOffset += INPUT_MEM_WRAP_OFFSET - INPUT_MEM_CONT_OFFSET
+                                    - INPUT_MEM_CONT_SIZE;
+                    }
+                    else if (INPUT_MEM_WRAP_SIZE > 0 && KERNEL_WIDTH > 1
+                        && CHANNELS_HEIGHT == 1 // single line (1D)!
+                        && iOffset + KERNEL_WIDTH * NB_CHANNELS
+                            > INPUT_MEM_CONT_SIZE)
+                    {
+                        wrapInRange = true;
+                    }
+
+                    const int wOffset = NB_CHANNELS * (sxMin
+                        + KERNEL_WIDTH * (syMin + sy + KERNEL_HEIGHT * output));
+
+                    if (!wrapInRange && (NB_CHANNELS == INPUT_MEM_STRIDE
+                        && ((PADDING_X == 0
+                            && OUTPUTS_WIDTH == OUTPUTS_WIDTH_NOPAD)
+                                || sxMax - sxMin == KERNEL_WIDTH)))
+                    {
+                        CustomMacsOnRange1(
+                            inputs + iOffset, 
+                            weights + wOffset, 
+                            KERNEL_WIDTH * NB_CHANNELS/4);
+                    }
+                    else {
+                        for (int sx = 0; sx < KERNEL_WIDTH; ++sx) {
+                            if ((PADDING_X != 0
+                                    || OUTPUTS_WIDTH != OUTPUTS_WIDTH_NOPAD)
+                                && sx >= sxMax - sxMin)
+                            {
+                                break;
+                            }
+
+                            int iOffsetInRange = iOffset
+                                + sx * INPUT_MEM_STRIDE;
+
+                            if (wrapInRange
+                                && iOffsetInRange >= INPUT_MEM_CONT_SIZE)
+                            {
+                                iOffsetInRange += INPUT_MEM_WRAP_OFFSET
+                                            - INPUT_MEM_CONT_OFFSET
+                                            - INPUT_MEM_CONT_SIZE;
+                            }
+                            CustomMacsOnRange1(
+                                inputs + iOffset, 
+                                weights + wOffset + sx * NB_CHANNELS, 
+                                KERNEL_WIDTH * NB_CHANNELS/4);
+
+                        }
+                    }
+                }
+                weightedSum = MacsResult(weightedSum);
+
+                outputs[oOffset + output]
+                    = sat(weightedSum, output, ACTIVATION, rescaling);
+            }
+        }
+    }
+}
+
+static void convcellPropagate1BufferVersion(
+    const UDATA_T* __restrict inputs,
+    UDATA_T* __restrict outputs,
+    const BDATA_T* __restrict biasses,
+    const WDATA_T* __restrict weights,
+    int rescaling,
+    int NB_CHANNELS, 
+    int CHANNELS_HEIGHT, int CHANNELS_WIDTH,
+    int NB_OUTPUTS,
+    int OUTPUTS_HEIGHT, int OUTPUTS_WIDTH,
+    int PADDING_Y, int PADDING_X,
+    int STRIDE_Y, int STRIDE_X,
+    int KERNEL_HEIGHT, int KERNEL_WIDTH,
+    ActivationFunction_T ACTIVATION,
+    // Memory mapping: inputs
+    int INPUT_MEM_CONT_OFFSET,
+    int INPUT_MEM_CONT_SIZE,
+    int INPUT_MEM_WRAP_OFFSET,
+    int INPUT_MEM_WRAP_SIZE,
+    int INPUT_MEM_STRIDE,
+    // Memory mapping: outputs
+    int OUTPUT_MEM_CONT_OFFSET,
+    int OUTPUT_MEM_CONT_SIZE,
+    int OUTPUT_MEM_WRAP_OFFSET,
+    int OUTPUT_MEM_WRAP_SIZE,
+    int OUTPUT_MEM_STRIDE)
+{
+    int OUTPUTS_HEIGHT_NOPAD
+        = (CHANNELS_HEIGHT - KERNEL_HEIGHT + STRIDE_Y) / STRIDE_Y;
+    int OUTPUTS_WIDTH_NOPAD
+        = (CHANNELS_WIDTH - KERNEL_WIDTH + STRIDE_X) / STRIDE_X;
+
+    for (int oy = 0; oy < OUTPUTS_HEIGHT; ++oy) {
+        const int syMin = (PADDING_Y == 0) ? 0
+            : max(PADDING_Y - (oy * STRIDE_Y), 0);
+        const int syMax = (PADDING_Y == 0
+                && OUTPUTS_HEIGHT == OUTPUTS_HEIGHT_NOPAD) ? KERNEL_HEIGHT
+            : clamp(CHANNELS_HEIGHT + PADDING_Y - (oy * STRIDE_Y), 
+                    0, KERNEL_HEIGHT);
+        const int iy = (oy * STRIDE_Y) - PADDING_Y;
+
+        for (int ox = 0; ox < OUTPUTS_WIDTH; ++ox) {
+
+            SetupMacsBuffer();
+
+            // moved to inner loop for collapsing -->
+            const int sxMin = (PADDING_X == 0) ? 0
+                : max(PADDING_X - (ox * STRIDE_X), 0);
+            const int sxMax = (PADDING_X == 0
+                    && OUTPUTS_WIDTH == OUTPUTS_WIDTH_NOPAD)
+                        ? KERNEL_WIDTH
+                : clamp(CHANNELS_WIDTH + PADDING_X - (ox * STRIDE_X), 
+                        0, KERNEL_WIDTH);
+            const int ix = (ox * STRIDE_X) - PADDING_X;
+
+            const int oPos = (ox + OUTPUTS_WIDTH * oy);
+            int oOffset = OUTPUT_MEM_STRIDE * oPos;
+
+            if (OUTPUT_MEM_WRAP_SIZE > 0 && oOffset >= OUTPUT_MEM_CONT_SIZE) {
+                oOffset += OUTPUT_MEM_WRAP_OFFSET - OUTPUT_MEM_CONT_OFFSET
+                            - OUTPUT_MEM_CONT_SIZE;
+            }
+            // <--
+
+            SUM_T weightedSum = biasses[0];
+
+            for (int sy = 0; sy < KERNEL_HEIGHT; ++sy) {
+                if ((PADDING_Y != 0
+                        || OUTPUTS_HEIGHT != OUTPUTS_HEIGHT_NOPAD)
+                    && sy >= syMax - syMin)
+                {
+                    break;
+                }
+
+                const int iPos = ((sxMin + ix)
+                                    + CHANNELS_WIDTH * (iy + syMin + sy));
+                int iOffset = INPUT_MEM_STRIDE * iPos;
+
+                // Wrapping cannot occur in the middle of a line, except if
+                // there is only one line (1D)!
+                bool wrapInRange = false;
+
+                if (INPUT_MEM_WRAP_SIZE > 0
+                    && iOffset >= INPUT_MEM_CONT_SIZE)
+                {
+                    iOffset += INPUT_MEM_WRAP_OFFSET - INPUT_MEM_CONT_OFFSET
+                                - INPUT_MEM_CONT_SIZE;
+                }
+                else if (INPUT_MEM_WRAP_SIZE > 0 && KERNEL_WIDTH > 1
+                    && CHANNELS_HEIGHT == 1 // single line (1D)!
+                    && iOffset + KERNEL_WIDTH * NB_CHANNELS
+                        > INPUT_MEM_CONT_SIZE)
+                {
+                    wrapInRange = true;
+                }
+
+                const int wOffset = NB_CHANNELS * (sxMin
+                    + KERNEL_WIDTH * (syMin + sy));
+
+                if (!wrapInRange && (NB_CHANNELS == INPUT_MEM_STRIDE
+                    && ((PADDING_X == 0
+                        && OUTPUTS_WIDTH == OUTPUTS_WIDTH_NOPAD)
+                            || sxMax - sxMin == KERNEL_WIDTH)))
+                {
+                    CustomMacsOnRange1(
+                        inputs + iOffset, 
+                        weights + wOffset, 
+                        KERNEL_WIDTH * NB_CHANNELS/4);
+
+                }
+                else {
+                    for (int sx = 0; sx < KERNEL_WIDTH; ++sx) {
+                        if ((PADDING_X != 0
+                                || OUTPUTS_WIDTH != OUTPUTS_WIDTH_NOPAD)
+                            && sx >= sxMax - sxMin)
+                        {
+                            break;
+                        }
+
+                        int iOffsetInRange = iOffset
+                            + sx * INPUT_MEM_STRIDE;
+
+                        if (wrapInRange
+                            && iOffsetInRange >= INPUT_MEM_CONT_SIZE)
+                        {
+                            iOffsetInRange += INPUT_MEM_WRAP_OFFSET
+                                        - INPUT_MEM_CONT_OFFSET
+                                        - INPUT_MEM_CONT_SIZE;
+                        }
+                        CustomMacsOnRange1(
+                            inputs + iOffset, 
+                            weights + wOffset + sx * NB_CHANNELS, 
+                            KERNEL_WIDTH * NB_CHANNELS/4);
+
+                    }
+                }
+            }
+
+            weightedSum = MacsResultBufferVersion(weightedSum);
+
+            outputs[oOffset]
+                = sat(weightedSum, 0, ACTIVATION, rescaling);
+            
+
+            for (int output = 1; output < NB_OUTPUTS; ++output) {
+
+                SUM_T weightedSum = biasses[output];
+
+                int sy = 0;
+                // for (int sy = 0; sy < KERNEL_HEIGHT; ++sy) {
+                if ((PADDING_Y != 0
+                        || OUTPUTS_HEIGHT != OUTPUTS_HEIGHT_NOPAD)
+                    && sy >= syMax - syMin)
+                {
+                    break;
+                }
+
+                const int iPos = ((sxMin + ix)
+                                    + CHANNELS_WIDTH * (iy + syMin + sy));
+                int iOffset = INPUT_MEM_STRIDE * iPos;
+
+                // Wrapping cannot occur in the middle of a line, except if
+                // there is only one line (1D)!
+                bool wrapInRange = false;
+
+                if (INPUT_MEM_WRAP_SIZE > 0
+                    && iOffset >= INPUT_MEM_CONT_SIZE)
+                {
+                    iOffset += INPUT_MEM_WRAP_OFFSET - INPUT_MEM_CONT_OFFSET
+                                - INPUT_MEM_CONT_SIZE;
+                }
+                else if (INPUT_MEM_WRAP_SIZE > 0 && KERNEL_WIDTH > 1
+                    && CHANNELS_HEIGHT == 1 // single line (1D)!
+                    && iOffset + KERNEL_WIDTH * NB_CHANNELS
+                        > INPUT_MEM_CONT_SIZE)
+                {
+                    wrapInRange = true;
+                }
+
+                const int wOffset = NB_CHANNELS * (sxMin
+                    + KERNEL_WIDTH * (syMin + sy + KERNEL_HEIGHT * output));
+
+                if (!wrapInRange && (NB_CHANNELS == INPUT_MEM_STRIDE
+                    && ((PADDING_X == 0
+                        && OUTPUTS_WIDTH == OUTPUTS_WIDTH_NOPAD)
+                            || sxMax - sxMin == KERNEL_WIDTH)))
+                {
+                    CustomMacsOnRangeBufferVersion(
+                        weights + wOffset, 
+                        KERNEL_WIDTH * KERNEL_HEIGHT * NB_CHANNELS/4);
+
+                }
+                else {
+                    for (int sx = 0; sx < KERNEL_WIDTH; ++sx) {
+                        if ((PADDING_X != 0
+                                || OUTPUTS_WIDTH != OUTPUTS_WIDTH_NOPAD)
+                            && sx >= sxMax - sxMin)
+                        {
+                            break;
+                        }
+
+                        int iOffsetInRange = iOffset
+                            + sx * INPUT_MEM_STRIDE;
+
+                        if (wrapInRange
+                            && iOffsetInRange >= INPUT_MEM_CONT_SIZE)
+                        {
+                            iOffsetInRange += INPUT_MEM_WRAP_OFFSET
+                                        - INPUT_MEM_CONT_OFFSET
+                                        - INPUT_MEM_CONT_SIZE;
+                        }
+                        CustomMacsOnRangeBufferVersion(
+                            weights + wOffset + sx * NB_CHANNELS, 
+                            KERNEL_WIDTH * NB_CHANNELS/4);
+
+                    }
+                }
+                weightedSum = MacsResultBufferVersion(weightedSum);
+
+                outputs[oOffset + output]
+                    = sat(weightedSum, output, ACTIVATION, rescaling);
+            }
+        }
+    }
+
+}
+
+
+
+
+static void convcellPropagate2(
     const UDATA_T* __restrict inputs,
     UDATA_T* __restrict outputs,
     const BDATA_T* __restrict biasses,
@@ -166,10 +654,10 @@ static void convcellPropagate1(
                             && OUTPUTS_WIDTH == OUTPUTS_WIDTH_NOPAD)
                                 || sxMax - sxMin == KERNEL_WIDTH)))
                     {
-                        macsOnRange(
+                        CustomMacsOnRange2(
                             inputs + iOffset, 
                             weights + wOffset, 
-                            &weightedSum,KERNEL_WIDTH * NB_CHANNELS);
+                            KERNEL_WIDTH * NB_CHANNELS/4);
                     }
                     else {
                         for (int sx = 0; sx < KERNEL_WIDTH; ++sx) {
@@ -190,15 +678,14 @@ static void convcellPropagate1(
                                             - INPUT_MEM_CONT_OFFSET
                                             - INPUT_MEM_CONT_SIZE;
                             }
-
-                            macsOnRange(
-                                // same input line so no wrapping can occur
+                            CustomMacsOnRange2(
                                 inputs + iOffsetInRange, 
                                 weights + wOffset + sx * NB_CHANNELS, 
-                                &weightedSum,NB_CHANNELS);
+                                NB_CHANNELS * NB_CHANNELS/4);
                         }
                     }
                 }
+                weightedSum = MacsResult(weightedSum);
 
                 outputs[oOffset + output]
                     = sat(weightedSum, output, ACTIVATION, rescaling);
@@ -206,6 +693,234 @@ static void convcellPropagate1(
         }
     }
 }
+
+
+static void convcellPropagate2BufferVersion(
+    const UDATA_T* __restrict inputs,
+    UDATA_T* __restrict outputs,
+    const BDATA_T* __restrict biasses,
+    const WDATA_T* __restrict weights,
+    int rescaling,
+    int NB_CHANNELS, 
+    int CHANNELS_HEIGHT, int CHANNELS_WIDTH,
+    int NB_OUTPUTS,
+    int OUTPUTS_HEIGHT, int OUTPUTS_WIDTH,
+    int PADDING_Y, int PADDING_X,
+    int STRIDE_Y, int STRIDE_X,
+    int KERNEL_HEIGHT, int KERNEL_WIDTH,
+    ActivationFunction_T ACTIVATION,
+    // Memory mapping: inputs
+    int INPUT_MEM_CONT_OFFSET,
+    int INPUT_MEM_CONT_SIZE,
+    int INPUT_MEM_WRAP_OFFSET,
+    int INPUT_MEM_WRAP_SIZE,
+    int INPUT_MEM_STRIDE,
+    // Memory mapping: outputs
+    int OUTPUT_MEM_CONT_OFFSET,
+    int OUTPUT_MEM_CONT_SIZE,
+    int OUTPUT_MEM_WRAP_OFFSET,
+    int OUTPUT_MEM_WRAP_SIZE,
+    int OUTPUT_MEM_STRIDE)
+{
+    int OUTPUTS_HEIGHT_NOPAD
+        = (CHANNELS_HEIGHT - KERNEL_HEIGHT + STRIDE_Y) / STRIDE_Y;
+    int OUTPUTS_WIDTH_NOPAD
+        = (CHANNELS_WIDTH - KERNEL_WIDTH + STRIDE_X) / STRIDE_X;
+
+    for (int oy = 0; oy < OUTPUTS_HEIGHT; ++oy) {
+        const int syMin = (PADDING_Y == 0) ? 0
+            : max(PADDING_Y - (oy * STRIDE_Y), 0);
+        const int syMax = (PADDING_Y == 0
+                && OUTPUTS_HEIGHT == OUTPUTS_HEIGHT_NOPAD) ? KERNEL_HEIGHT
+            : clamp(CHANNELS_HEIGHT + PADDING_Y - (oy * STRIDE_Y), 
+                    0, KERNEL_HEIGHT);
+        const int iy = (oy * STRIDE_Y) - PADDING_Y;
+
+        for (int ox = 0; ox < OUTPUTS_WIDTH; ++ox) {
+
+            SetupMacsBuffer();
+
+            // moved to inner loop for collapsing -->
+            const int sxMin = (PADDING_X == 0) ? 0
+                : max(PADDING_X - (ox * STRIDE_X), 0);
+            const int sxMax = (PADDING_X == 0
+                    && OUTPUTS_WIDTH == OUTPUTS_WIDTH_NOPAD)
+                        ? KERNEL_WIDTH
+                : clamp(CHANNELS_WIDTH + PADDING_X - (ox * STRIDE_X), 
+                        0, KERNEL_WIDTH);
+            const int ix = (ox * STRIDE_X) - PADDING_X;
+
+            const int oPos = (ox + OUTPUTS_WIDTH * oy);
+            int oOffset = OUTPUT_MEM_STRIDE * oPos;
+
+            if (OUTPUT_MEM_WRAP_SIZE > 0 && oOffset >= OUTPUT_MEM_CONT_SIZE) {
+                oOffset += OUTPUT_MEM_WRAP_OFFSET - OUTPUT_MEM_CONT_OFFSET
+                            - OUTPUT_MEM_CONT_SIZE;
+            }
+            // <--
+
+            SUM_T weightedSum = biasses[0];
+
+            for (int sy = 0; sy < KERNEL_HEIGHT; ++sy) {
+                if ((PADDING_Y != 0
+                        || OUTPUTS_HEIGHT != OUTPUTS_HEIGHT_NOPAD)
+                    && sy >= syMax - syMin)
+                {
+                    break;
+                }
+
+                const int iPos = ((sxMin + ix)
+                                    + CHANNELS_WIDTH * (iy + syMin + sy));
+                int iOffset = INPUT_MEM_STRIDE * iPos;
+
+                // Wrapping cannot occur in the middle of a line, except if
+                // there is only one line (1D)!
+                bool wrapInRange = false;
+
+                if (INPUT_MEM_WRAP_SIZE > 0
+                    && iOffset >= INPUT_MEM_CONT_SIZE)
+                {
+                    iOffset += INPUT_MEM_WRAP_OFFSET - INPUT_MEM_CONT_OFFSET
+                                - INPUT_MEM_CONT_SIZE;
+                }
+                else if (INPUT_MEM_WRAP_SIZE > 0 && KERNEL_WIDTH > 1
+                    && CHANNELS_HEIGHT == 1 // single line (1D)!
+                    && iOffset + KERNEL_WIDTH * NB_CHANNELS
+                        > INPUT_MEM_CONT_SIZE)
+                {
+                    wrapInRange = true;
+                }
+
+                const int wOffset = NB_CHANNELS * (sxMin
+                    + KERNEL_WIDTH * (syMin + sy));
+
+                if (!wrapInRange && (NB_CHANNELS == INPUT_MEM_STRIDE
+                    && ((PADDING_X == 0
+                        && OUTPUTS_WIDTH == OUTPUTS_WIDTH_NOPAD)
+                            || sxMax - sxMin == KERNEL_WIDTH)))
+                {
+                    CustomMacsOnRange2(
+                        inputs + iOffset, 
+                        weights + wOffset, 
+                        KERNEL_WIDTH * NB_CHANNELS/4);
+                }
+                else {
+                    for (int sx = 0; sx < KERNEL_WIDTH; ++sx) {
+                        if ((PADDING_X != 0
+                                || OUTPUTS_WIDTH != OUTPUTS_WIDTH_NOPAD)
+                            && sx >= sxMax - sxMin)
+                        {
+                            break;
+                        }
+
+                        int iOffsetInRange = iOffset
+                            + sx * INPUT_MEM_STRIDE;
+
+                        if (wrapInRange
+                            && iOffsetInRange >= INPUT_MEM_CONT_SIZE)
+                        {
+                            iOffsetInRange += INPUT_MEM_WRAP_OFFSET
+                                        - INPUT_MEM_CONT_OFFSET
+                                        - INPUT_MEM_CONT_SIZE;
+                        }
+
+                        CustomMacsOnRange2(
+                            inputs + iOffsetInRange, 
+                            weights + wOffset + sx * NB_CHANNELS, 
+                            NB_CHANNELS * NB_CHANNELS/4);
+                    }
+                }
+            }
+ 
+            weightedSum = MacsResultBufferVersion(weightedSum);
+
+            outputs[oOffset]
+                = sat(weightedSum, 0, ACTIVATION, rescaling);
+
+
+
+            for (int output = 1; output < NB_OUTPUTS; ++output) {
+                SUM_T weightedSum = biasses[output];
+
+                for (int sy = 0; sy < KERNEL_HEIGHT; ++sy) {
+                    if ((PADDING_Y != 0
+                            || OUTPUTS_HEIGHT != OUTPUTS_HEIGHT_NOPAD)
+                        && sy >= syMax - syMin)
+                    {
+                        break;
+                    }
+
+                    const int iPos = ((sxMin + ix)
+                                        + CHANNELS_WIDTH * (iy + syMin + sy));
+                    int iOffset = INPUT_MEM_STRIDE * iPos;
+
+                    // Wrapping cannot occur in the middle of a line, except if
+                    // there is only one line (1D)!
+                    bool wrapInRange = false;
+
+                    if (INPUT_MEM_WRAP_SIZE > 0
+                        && iOffset >= INPUT_MEM_CONT_SIZE)
+                    {
+                        iOffset += INPUT_MEM_WRAP_OFFSET - INPUT_MEM_CONT_OFFSET
+                                    - INPUT_MEM_CONT_SIZE;
+                    }
+                    else if (INPUT_MEM_WRAP_SIZE > 0 && KERNEL_WIDTH > 1
+                        && CHANNELS_HEIGHT == 1 // single line (1D)!
+                        && iOffset + KERNEL_WIDTH * NB_CHANNELS
+                            > INPUT_MEM_CONT_SIZE)
+                    {
+                        wrapInRange = true;
+                    }
+
+                    const int wOffset = NB_CHANNELS * (sxMin
+                        + KERNEL_WIDTH * (syMin + sy + KERNEL_HEIGHT * output));
+
+                    if (!wrapInRange && (NB_CHANNELS == INPUT_MEM_STRIDE
+                        && ((PADDING_X == 0
+                            && OUTPUTS_WIDTH == OUTPUTS_WIDTH_NOPAD)
+                                || sxMax - sxMin == KERNEL_WIDTH)))
+                    {
+                        CustomMacsOnRangeBufferVersion(
+                            weights + wOffset, 
+                            KERNEL_WIDTH * NB_CHANNELS/4);
+                    }
+                    else {
+                        for (int sx = 0; sx < KERNEL_WIDTH; ++sx) {
+                            if ((PADDING_X != 0
+                                    || OUTPUTS_WIDTH != OUTPUTS_WIDTH_NOPAD)
+                                && sx >= sxMax - sxMin)
+                            {
+                                break;
+                            }
+
+                            int iOffsetInRange = iOffset
+                                + sx * INPUT_MEM_STRIDE;
+
+                            if (wrapInRange
+                                && iOffsetInRange >= INPUT_MEM_CONT_SIZE)
+                            {
+                                iOffsetInRange += INPUT_MEM_WRAP_OFFSET
+                                            - INPUT_MEM_CONT_OFFSET
+                                            - INPUT_MEM_CONT_SIZE;
+                            }
+                            CustomMacsOnRangeBufferVersion(
+                                weights + wOffset + sx * NB_CHANNELS, 
+                                NB_CHANNELS * NB_CHANNELS/4);
+                        }
+                    }
+                }
+
+                weightedSum = MacsResultBufferVersion(weightedSum);
+
+                outputs[oOffset + output]
+                    = sat(weightedSum, output, ACTIVATION, rescaling);
+            }
+        }
+    }
+}
+
+
+
 
 static void fccellPropagateUDATA_T(
     const UDATA_T* __restrict inputs,
@@ -262,10 +977,10 @@ static void fccellPropagateUDATA_T(
                                     * (iy + CHANNELS_HEIGHT * och);
 
             if (!wrapInRange && INPUT_MEM_STRIDE == NB_CHANNELS) {
-                macsOnRange(
+                CustomMacsOnRange2(
                     inputs + iOffset, 
                     weights + wOffset, 
-                    &weightedSum, NB_CHANNELS * CHANNELS_WIDTH);
+                    NB_CHANNELS * CHANNELS_WIDTH/4);
             }
             else {
                 for (int ix = 0; ix < CHANNELS_WIDTH; ++ix) {
@@ -279,17 +994,162 @@ static void fccellPropagateUDATA_T(
                                     - INPUT_MEM_CONT_SIZE;
                     }
 
-                    macsOnRange(
+                    CustomMacsOnRange2(
                         inputs + iOffsetInRange, 
                         weights + wOffset + ix * NB_CHANNELS, 
-                        &weightedSum, NB_CHANNELS);
+                        NB_CHANNELS/4);
+
                 }
             }
         }
+        weightedSum = MacsResult(weightedSum);
 
         outputs[och] = sat(weightedSum, och, ACTIVATION, rescaling);
     }
 }
+
+static void fccellPropagateBufferVersionUDATA_T(
+    const UDATA_T* __restrict inputs,
+    UDATA_T* __restrict outputs,
+    const BDATA_T* __restrict biasses,
+    const WDATA_T* __restrict weights,
+    const int rescaling,
+    int NB_CHANNELS, 
+    int CHANNELS_HEIGHT, int CHANNELS_WIDTH,
+    int NB_OUTPUTS,
+    int OUTPUTS_HEIGHT, int OUTPUTS_WIDTH,
+    ActivationFunction_T ACTIVATION,
+    // Memory mapping: inputs
+    int INPUT_MEM_CONT_OFFSET,
+    int INPUT_MEM_CONT_SIZE,
+    int INPUT_MEM_WRAP_OFFSET,
+    int INPUT_MEM_WRAP_SIZE,
+    int INPUT_MEM_STRIDE,
+    // Memory mapping: outputs
+    int OUTPUT_MEM_CONT_OFFSET,
+    int OUTPUT_MEM_CONT_SIZE,
+    int OUTPUT_MEM_WRAP_OFFSET,
+    int OUTPUT_MEM_WRAP_SIZE,
+    int OUTPUT_MEM_STRIDE)
+{
+    // static_assert(OUTPUTS_HEIGHT == 1, "Outputs height should be 1");
+    // static_assert(OUTPUTS_WIDTH == 1, "Outputs width should be 1");
+    // static_assert(OUTPUT_MEM_WRAP_SIZE == 0, "Output wrapping not supported");
+    SetupMacsBuffer();
+
+    SUM_T weightedSum = biasses[0];
+
+    for (int iy = 0; iy < CHANNELS_HEIGHT; ++iy) {
+        const int iPos = (CHANNELS_WIDTH * iy);
+        int iOffset = INPUT_MEM_STRIDE * iPos;
+
+        // Wrapping cannot occur in the middle of a line, except if
+        // there is only one line (1D)!
+        bool wrapInRange = false;
+
+        if (INPUT_MEM_WRAP_SIZE > 0 && iOffset >= INPUT_MEM_CONT_SIZE) {
+            iOffset += INPUT_MEM_WRAP_OFFSET - INPUT_MEM_CONT_OFFSET
+                        - INPUT_MEM_CONT_SIZE;
+        }
+        else if (INPUT_MEM_WRAP_SIZE > 0 && CHANNELS_WIDTH > 1
+            && CHANNELS_HEIGHT == 1 // single line (1D)!
+            && iOffset + CHANNELS_WIDTH * NB_CHANNELS
+                > INPUT_MEM_CONT_SIZE)
+        {
+            wrapInRange = true;
+        }
+
+        const int wOffset = NB_CHANNELS * CHANNELS_WIDTH
+                                * (iy);
+
+        if (!wrapInRange && INPUT_MEM_STRIDE == NB_CHANNELS) {
+            CustomMacsOnRange2(
+                inputs + iOffset, 
+                weights + wOffset, 
+                NB_CHANNELS * CHANNELS_WIDTH/4);
+        }
+        else {
+            for (int ix = 0; ix < CHANNELS_WIDTH; ++ix) {
+                int iOffsetInRange = iOffset + ix * INPUT_MEM_STRIDE;
+
+                if (wrapInRange
+                    && iOffsetInRange >= INPUT_MEM_CONT_SIZE)
+                {
+                    iOffsetInRange += INPUT_MEM_WRAP_OFFSET
+                                - INPUT_MEM_CONT_OFFSET
+                                - INPUT_MEM_CONT_SIZE;
+                }
+
+                CustomMacsOnRange2(
+                    inputs + iOffsetInRange, 
+                    weights + wOffset + ix * NB_CHANNELS, 
+                    NB_CHANNELS/4);
+            }
+        }
+    }
+
+    weightedSum = MacsResultBufferVersion(weightedSum);
+
+    outputs[0] = sat(weightedSum, 0, ACTIVATION, rescaling);
+
+
+    for (int och = 1; och < NB_OUTPUTS; och++) {
+        SUM_T weightedSum = biasses[och];
+
+        for (int iy = 0; iy < CHANNELS_HEIGHT; ++iy) {
+            const int iPos = (CHANNELS_WIDTH * iy);
+            int iOffset = INPUT_MEM_STRIDE * iPos;
+
+            // Wrapping cannot occur in the middle of a line, except if
+            // there is only one line (1D)!
+            bool wrapInRange = false;
+
+            if (INPUT_MEM_WRAP_SIZE > 0 && iOffset >= INPUT_MEM_CONT_SIZE) {
+                iOffset += INPUT_MEM_WRAP_OFFSET - INPUT_MEM_CONT_OFFSET
+                            - INPUT_MEM_CONT_SIZE;
+            }
+            else if (INPUT_MEM_WRAP_SIZE > 0 && CHANNELS_WIDTH > 1
+                && CHANNELS_HEIGHT == 1 // single line (1D)!
+                && iOffset + CHANNELS_WIDTH * NB_CHANNELS
+                    > INPUT_MEM_CONT_SIZE)
+            {
+                wrapInRange = true;
+            }
+
+            const int wOffset = NB_CHANNELS * CHANNELS_WIDTH
+                                    * (iy + CHANNELS_HEIGHT * och);
+
+            if (!wrapInRange && INPUT_MEM_STRIDE == NB_CHANNELS) {
+                CustomMacsOnRangeBufferVersion(
+                    weights + wOffset, 
+                    NB_CHANNELS * CHANNELS_WIDTH/4);
+            }
+            else {
+                for (int ix = 0; ix < CHANNELS_WIDTH; ++ix) {
+                    int iOffsetInRange = iOffset + ix * INPUT_MEM_STRIDE;
+
+                    if (wrapInRange
+                        && iOffsetInRange >= INPUT_MEM_CONT_SIZE)
+                    {
+                        iOffsetInRange += INPUT_MEM_WRAP_OFFSET
+                                    - INPUT_MEM_CONT_OFFSET
+                                    - INPUT_MEM_CONT_SIZE;
+                    }
+
+                    CustomMacsOnRangeBufferVersion(
+                        weights + wOffset + ix * NB_CHANNELS, 
+                        NB_CHANNELS/4);
+
+                }
+            }
+        }
+
+        weightedSum = MacsResultBufferVersion(weightedSum);
+
+        outputs[och] = sat(weightedSum, och, ACTIVATION, rescaling);
+    }
+}
+
 
 static void fccellPropagateDATA_T(
     const UDATA_T* __restrict inputs,
@@ -370,7 +1230,6 @@ static void fccellPropagateDATA_T(
                 }
             }
         }
-
         outputs[och] = sat(weightedSum, och, ACTIVATION, rescaling);
     }
 }
@@ -434,7 +1293,7 @@ void propagate(const UDATA_T* inputs, Target_T* outputs, UDATA_T* maxPropagate_v
     const Tick_T start_conv1 = tick();
 #endif
 
-    convcellPropagate1(inputs , conv1_output, conv1_biases, conv1_weights, 8,
+    convcellPropagate1BufferVersion(inputs , conv1_output, conv1_biases, conv1_weights, 8,
     CONV1_NB_CHANNELS, CONV1_CHANNELS_HEIGHT, CONV1_CHANNELS_WIDTH, CONV1_NB_OUTPUTS, CONV1_OUTPUTS_HEIGHT, 
     CONV1_OUTPUTS_WIDTH, CONV1_PADDING_Y, CONV1_PADDING_X, CONV1_STRIDE_Y, CONV1_STRIDE_X, CONV1_KERNEL_HEIGHT, 
     CONV1_KERNEL_WIDTH, CONV1_ACTIVATION, ENV_MEM_CONT_OFFSET, ENV_MEM_CONT_SIZE, ENV_MEM_WRAP_OFFSET, 
@@ -464,7 +1323,7 @@ void propagate(const UDATA_T* inputs, Target_T* outputs, UDATA_T* maxPropagate_v
     const Tick_T start_conv2 = tick();
 #endif
 
-    convcellPropagate1(conv1_output , conv2_output, conv2_biases, conv2_weights, 8,
+    convcellPropagate2BufferVersion(conv1_output , conv2_output, conv2_biases, conv2_weights, 8,
     CONV2_NB_CHANNELS, CONV2_CHANNELS_HEIGHT, CONV2_CHANNELS_WIDTH, 
     CONV2_NB_OUTPUTS, CONV2_OUTPUTS_HEIGHT, CONV2_OUTPUTS_WIDTH, 
     CONV2_PADDING_Y, CONV2_PADDING_X, CONV2_STRIDE_Y, CONV2_STRIDE_X, 
@@ -497,7 +1356,7 @@ void propagate(const UDATA_T* inputs, Target_T* outputs, UDATA_T* maxPropagate_v
     const Tick_T start_fc1 = tick();
 #endif
 
-    fccellPropagateUDATA_T(conv2_output , fc1_output, fc1_biases, fc1_weights, 8,
+    fccellPropagateBufferVersionUDATA_T(conv2_output , fc1_output, fc1_biases, fc1_weights, 8,
     FC1_NB_CHANNELS, FC1_CHANNELS_HEIGHT, 
     FC1_CHANNELS_WIDTH, FC1_NB_OUTPUTS, 
     FC1_OUTPUTS_HEIGHT, FC1_OUTPUTS_WIDTH, FC1_ACTIVATION, 
@@ -569,5 +1428,3 @@ float Network::backpropagate(const DATA_T* input, const std::int32_t* labels){
 int Network::gradientCheck(){
    return(0);
 }*/
-
-
